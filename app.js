@@ -130,23 +130,16 @@ function buildRecord(file, buf, group) {
     .filter(n => n > 0);
   if (ptMatches.length) data.points = Math.max(...ptMatches);
 
-  // ㋩ 10小計円 - 「10小計」アイテムを見つけ、そのすぐ右の数値を取得
-  const smallSumLabel = items.find(i => i.str.includes('10小計') && !i.str.includes('点'));
-  // 「10小計」は2回出現 (左:点数、右:円)。右側のもの (xが大きい方) を取る
+  // ㋩ = 左側 10小計 (点数). 「10小計」ラベルが2回出るうちxが小さい方
   const smallSumLabels = items.filter(i => i.str.includes('10小計'));
-  let smallSumLabelRight = smallSumLabels.sort((a, b) => b.x - a.x)[0];
-  if (smallSumLabelRight) {
-    // 同行 (yが近い)・xが右側のアイテムから数値を探す
+  const smallSumLabelLeft = smallSumLabels.sort((a, b) => a.x - b.x)[0];
+  if (smallSumLabelLeft) {
     const candidates = items.filter(i =>
-      Math.abs(i.y - smallSumLabelRight.y) < 5 &&
-      i.x > smallSumLabelRight.x &&
+      Math.abs(i.y - smallSumLabelLeft.y) < 5 &&
+      i.x > smallSumLabelLeft.x && i.x < smallSumLabelLeft.x + 200 &&
       /^[\d,]+$/.test(i.str.trim())
     ).sort((a, b) => a.x - b.x);
     if (candidates.length) data.smallSum = parseInt(candidates[0].str.replace(/,/g, ''));
-  }
-  if (!data.smallSum) {
-    const m = fullText.match(/10小計[\s\S]{0,80}?([\d,]+)\s*円/);
-    if (m) data.smallSum = parseInt(m[1].replace(/,/g, ''));
   }
 
   return data;
@@ -155,7 +148,7 @@ function buildRecord(file, buf, group) {
 // ========== 計算 ==========
 function calc(r) {
   const A = r.points * 20;
-  const C = Math.round(r.smallSum * 1.2);
+  const C = (r.smallSum || 0) * 12;
   const ho = (r.ho_count || 0) * 6500;
   const he = (r.he_count || 0) * 3300;
   r.ho_amount = ho;
