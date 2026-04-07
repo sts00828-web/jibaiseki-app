@@ -131,10 +131,23 @@ function buildRecord(file, buf, group) {
   if (ptMatches.length) data.points = Math.max(...ptMatches);
 
   // ㋩ = 左側 10小計 (点数)
-  // テキスト全体から「10小計\s*数値」を取得 (最初の出現が左側)
-  const leftSmallMatches = [...fullText.matchAll(/10小計[\s\S]{0,20}?(\d{1,5})/g)];
-  if (leftSmallMatches.length) {
-    data.smallSum = parseInt(leftSmallMatches[0][1]);
+  const koukeiItems = items.filter(i => /小計/.test(i.str));
+  console.log('[DEBUG] 小計アイテム:', koukeiItems.map(i => ({ str: i.str, x: Math.round(i.x), y: Math.round(i.y) })));
+  // 左側 (xが小さい方) を選び、その同行の数値を取得
+  if (koukeiItems.length) {
+    const left = koukeiItems.sort((a, b) => a.x - b.x)[0];
+    const rowNums = items.filter(i =>
+      Math.abs(i.y - left.y) < 8 &&
+      i.x > left.x && i.x < left.x + 250 &&
+      /^\d+$/.test(i.str.trim())
+    ).sort((a, b) => a.x - b.x);
+    console.log('[DEBUG] 左小計 同行数値:', rowNums.map(i => i.str));
+    if (rowNums.length) data.smallSum = parseInt(rowNums[0].str);
+  }
+  // フォールバック: テキスト全体検索
+  if (!data.smallSum) {
+    const m = fullText.match(/10小計\s*(\d{1,5})/);
+    if (m) data.smallSum = parseInt(m[1]);
   }
 
   return data;
