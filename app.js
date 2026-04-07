@@ -130,27 +130,10 @@ function buildRecord(file, buf, group) {
     .filter(n => n > 0);
   if (ptMatches.length) data.points = Math.max(...ptMatches);
 
-  // ㋩ = 右側 10小計 (円). 全「小計」のうち右側 (xが大きい) かつ金額欄
-  const koukeiItems = items.filter(i => /小計/.test(i.str));
-  console.log('[DEBUG] 全小計:', JSON.stringify(koukeiItems.map(i => ({s: i.str, x: Math.round(i.x), y: Math.round(i.y)}))));
-  // x座標で2グループに分け、右側を採用
-  const xs = koukeiItems.map(i => i.x);
-  const midX = (Math.min(...xs) + Math.max(...xs)) / 2;
-  const rightKoukei = koukeiItems.filter(i => i.x > midX);
-  console.log('[DEBUG] 右小計:', JSON.stringify(rightKoukei.map(i => ({s: i.str, x: Math.round(i.x), y: Math.round(i.y)}))));
-  if (rightKoukei.length) {
-    // 右側で最上段 (10小計のはず)
-    const top = rightKoukei.sort((a, b) => b.y - a.y)[0];
-    const rowNums = items.filter(i =>
-      Math.abs(i.y - top.y) < 8 &&
-      i.x > top.x &&
-      /^[\d,]+$/.test(i.str.trim())
-    ).sort((a, b) => a.x - b.x);
-    const top0 = top;
-    const sameRowAll = items.filter(i => Math.abs(i.y - top0.y) < 8);
-    console.log('[DEBUG] 右10小計同行全:', JSON.stringify(sameRowAll.map(i => ({s: i.str, x: Math.round(i.x)}))));
-    if (rowNums.length) data.smallSum = parseInt(rowNums[0].str.replace(/,/g, ''));
-  }
+  // ㋩ = 右側 10小計 (円).
+  // テキスト全体から「10小計 ... 数値 円」パターンを探す
+  const m = fullText.match(/10小計[\s\S]{0,60}?([\d,]+)\s*円/);
+  if (m) data.smallSum = parseInt(m[1].replace(/,/g, ''));
   // フォールバック: テキスト全体検索
   if (!data.smallSum) {
     const m = fullText.match(/10小計\s*(\d{1,5})/);
