@@ -480,6 +480,14 @@ window.addEventListener('DOMContentLoaded', () => {
     refreshPayeeOptions();
   });
 
+  $('#delete-payee').addEventListener('click', () => {
+    const v = $('#bulk-payee').value;
+    if (!v) return;
+    if (!confirm(`「${v}」を削除しますか？`)) return;
+    savePayees(loadPayees().filter(p => p !== v));
+    refreshPayeeOptions();
+  });
+
   $('#apply-payee').addEventListener('click', () => {
     const v = $('#bulk-payee').value;
     if (!v) return;
