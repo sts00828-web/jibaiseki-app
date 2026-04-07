@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>自賠責レセプト自動処理</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>自賠責レセプト自動処理</h1>
+  <p class="subtitle">デジカル出力PDFを一括修正・金額自動計算</p>
+</header>
+
+<main>
+  <section id="upload-section">
+    <div id="dropzone">
+      <p>PDFファイルをここにドラッグ&ドロップ<br>または</p>
+      <input type="file" id="file-input" accept="application/pdf" multiple>
+      <label for="file-input" class="btn">ファイルを選択</label>
+    </div>
+    <p id="status"></p>
+  </section>
+
+  <section id="bulk-controls" style="display:none;">
+    <h2>一括設定</h2>
+    <div class="bulk-row">
+      <label>請求先：
+        <select id="bulk-payee"><option value="">（選択）</option></select>
+        <input type="text" id="new-payee" placeholder="新規請求先を追加">
+        <button id="add-payee" class="btn-sm">追加</button>
+      </label>
+      <button id="apply-payee" class="btn-sm">全員に適用</button>
+    </div>
+    <div class="bulk-row">
+      <label>日付（請求/受領日）：
+        <input type="date" id="bulk-date">
+      </label>
+      <button id="apply-date" class="btn-sm">全員に適用</button>
+    </div>
+  </section>
+
+  <section id="table-section" style="display:none;">
+    <h2>レセプト一覧 <span id="count"></span></h2>
+    <div class="table-wrap">
+      <table id="recept-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>患者名</th>
+            <th>診療月</th>
+            <th>実日数</th>
+            <th>㋑点数</th>
+            <th>A<br>(㋑×20)</th>
+            <th>㋩</th>
+            <th>C<br>(㋩×1.2)</th>
+            <th>ニ<br>その他</th>
+            <th>ホ通数<br>診断書</th>
+            <th>ホ金額<br>(自動)</th>
+            <th>ヘ通数<br>明細書</th>
+            <th>ヘ金額<br>(自動)</th>
+            <th>D計</th>
+            <th>合計</th>
+            <th>請求先</th>
+            <th>日付</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="actions">
+      <button id="generate-btn" class="btn">修正PDFを一括生成</button>
+    </div>
+  </section>
+</main>
+
+<script src="lib/pdf.min.js"></script>
+<script src="lib/pdf-lib.min.js"></script>
+<script src="lib/fontkit.umd.min.js"></script>
+<script src="lib/jszip.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
