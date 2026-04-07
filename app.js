@@ -130,16 +130,11 @@ function buildRecord(file, buf, group) {
     .filter(n => n > 0);
   if (ptMatches.length) data.points = Math.max(...ptMatches);
 
-  // ㋩ = 左側 10小計 (点数). 「10小計」ラベルが2回出るうちxが小さい方
-  const smallSumLabels = items.filter(i => i.str.includes('10小計'));
-  const smallSumLabelLeft = smallSumLabels.sort((a, b) => a.x - b.x)[0];
-  if (smallSumLabelLeft) {
-    const candidates = items.filter(i =>
-      Math.abs(i.y - smallSumLabelLeft.y) < 5 &&
-      i.x > smallSumLabelLeft.x && i.x < smallSumLabelLeft.x + 200 &&
-      /^[\d,]+$/.test(i.str.trim())
-    ).sort((a, b) => a.x - b.x);
-    if (candidates.length) data.smallSum = parseInt(candidates[0].str.replace(/,/g, ''));
+  // ㋩ = 左側 10小計 (点数)
+  // テキスト全体から「10小計\s*数値」を取得 (最初の出現が左側)
+  const leftSmallMatches = [...fullText.matchAll(/10小計[\s\S]{0,20}?(\d{1,5})/g)];
+  if (leftSmallMatches.length) {
+    data.smallSum = parseInt(leftSmallMatches[0][1]);
   }
 
   return data;
