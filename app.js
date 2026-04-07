@@ -132,7 +132,12 @@ function buildRecord(file, buf, group) {
 
   // ㋩ = 右側 10小計 (円). 全「小計」のうち右側 (xが大きい) かつ金額欄
   const koukeiItems = items.filter(i => /小計/.test(i.str));
-  const rightKoukei = koukeiItems.filter(i => i.x >= 350);
+  console.log('[DEBUG] 全小計:', koukeiItems.map(i => ({s: i.str, x: Math.round(i.x), y: Math.round(i.y)})));
+  // x座標で2グループに分け、右側を採用
+  const xs = koukeiItems.map(i => i.x);
+  const midX = (Math.min(...xs) + Math.max(...xs)) / 2;
+  const rightKoukei = koukeiItems.filter(i => i.x > midX);
+  console.log('[DEBUG] 右小計:', rightKoukei.map(i => ({s: i.str, x: Math.round(i.x), y: Math.round(i.y)})));
   if (rightKoukei.length) {
     // 右側で最上段 (10小計のはず)
     const top = rightKoukei.sort((a, b) => b.y - a.y)[0];
@@ -141,6 +146,7 @@ function buildRecord(file, buf, group) {
       i.x > top.x &&
       /^[\d,]+$/.test(i.str.trim())
     ).sort((a, b) => a.x - b.x);
+    console.log('[DEBUG] 右10小計 同行数値:', rowNums.map(i => i.str));
     if (rowNums.length) data.smallSum = parseInt(rowNums[0].str.replace(/,/g, ''));
   }
   // フォールバック: テキスト全体検索
