@@ -130,18 +130,18 @@ function buildRecord(file, buf, group) {
     .filter(n => n > 0);
   if (ptMatches.length) data.points = Math.max(...ptMatches);
 
-  // ㋩ = 左側 10小計 (点数). 全「小計」のうち最上段(yが最大)が10小計
+  // ㋩ = 右側 10小計 (円). 全「小計」のうち右側 (xが大きい) かつ金額欄
   const koukeiItems = items.filter(i => /小計/.test(i.str));
-  // 左側だけに絞る (右側は金額欄)
-  const leftKoukei = koukeiItems.filter(i => i.x < 350);
-  if (leftKoukei.length) {
-    const top = leftKoukei.sort((a, b) => b.y - a.y)[0];
+  const rightKoukei = koukeiItems.filter(i => i.x >= 350);
+  if (rightKoukei.length) {
+    // 右側で最上段 (10小計のはず)
+    const top = rightKoukei.sort((a, b) => b.y - a.y)[0];
     const rowNums = items.filter(i =>
       Math.abs(i.y - top.y) < 8 &&
-      i.x > top.x && i.x < top.x + 250 &&
-      /^\d+$/.test(i.str.trim())
+      i.x > top.x &&
+      /^[\d,]+$/.test(i.str.trim())
     ).sort((a, b) => a.x - b.x);
-    if (rowNums.length) data.smallSum = parseInt(rowNums[0].str);
+    if (rowNums.length) data.smallSum = parseInt(rowNums[0].str.replace(/,/g, ''));
   }
   // フォールバック: テキスト全体検索
   if (!data.smallSum) {
@@ -155,7 +155,7 @@ function buildRecord(file, buf, group) {
 // ========== 計算 ==========
 function calc(r) {
   const A = r.points * 20;
-  const C = (r.smallSum || 0) * 12;
+  const C = Math.round((r.smallSum || 0) * 1.2);
   const ho = (r.ho_count || 0) * 6500;
   const he = (r.he_count || 0) * 3300;
   r.ho_amount = ho;
