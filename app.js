@@ -103,15 +103,20 @@ function buildRecord(file, buf, group) {
     date: ''
   };
 
-  // 氏名: 「氏名」のすぐ後ろの非数値・非記号テキスト
+  // 氏名: 「氏名」のすぐ後ろの非数値・非記号テキストを結合（フルネーム）
   const nameIdx = items.findIndex(i => i.str.includes('氏'));
   if (nameIdx >= 0) {
-    for (let k = nameIdx + 1; k < Math.min(nameIdx + 8, items.length); k++) {
+    const nameParts = [];
+    let refY = null;
+    for (let k = nameIdx + 1; k < Math.min(nameIdx + 12, items.length); k++) {
       const s = items[k].str.trim();
-      if (s && s !== '名' && !/^\d/.test(s) && !/年|月|男|女|才/.test(s)) {
-        data.name = s; break;
-      }
+      if (!s || s === '名') continue;
+      if (/^\d/.test(s) || /[年月男女才生]/.test(s)) break;
+      if (refY === null) refY = items[k].y;
+      if (Math.abs(items[k].y - refY) > 10) break;
+      nameParts.push(s);
     }
+    data.name = nameParts.join(' ');
   }
 
   // 診療期間
@@ -246,22 +251,6 @@ async function handleFiles(files) {
 }
 
 // ========== PDF修正 ==========
-async function generateFixedPdf(r) {
-  const { PDFDocument, rgb } = PDFLib;
-  const srcDoc = await PDFDocument.load(r.originalBytes.slice(0));
-  const newDoc = await PDFDocument.create();
-  newDoc.registerFontkit(fontkit);
-  const font = await newDoc.embedFont(await loadFont(), { subset: true });
-  // 該当ページだけコピー
-  const copied = await newDoc.copyPages(srcDoc, r.pageNums);
-  copied.forEach(p => newDoc.addPage(p));
-  const pages = newDoc.getPages();
-  const { A, C, D, total } = calc(r);
-  for (let pi = 0; pi < pages.length; pi++) {
-    applyFixesToPage(pages[pi], r.pagesItems[pi] || [], r, { A, C, D, total }, font, rgb);
-  }
-  return await newDoc.save();
-}
 
 function applyFixesToPage(page, items, r, calcResult, font, rgb) {
   const { A, C, D, total } = calcResult;
@@ -415,28 +404,62 @@ function applyFixesToPage(page, items, r, calcResult, font, rgb) {
   }
 }
 
-// ========== ZIP生成 ==========
+// ========== PDF生成（元PDFを直接修正 — フォント保持） ==========
 async function generateAll() {
   if (!records.length) return;
   $('#generate-btn').disabled = true;
   $('#status').textContent = 'PDF生成中...';
-  const { PDFDocument } = PDFLib;
-  const merged = await PDFDocument.create();
+
+  const { PDFDocument, rgb } = PDFLib;
+
+  // ソースファイルごとにグループ化（同じファイル内の全患者をまとめて処理）
+  const fileGroups = new Map();
+  for (const r of records) {
+    if (!fileGroups.has(r.originalBytes)) {
+      fileGroups.set(r.originalBytes, { fileName: r.fileName, records: [] });
+    }
+    fileGroups.get(r.originalBytes).records.push(r);
+  }
+
+  const outputs = [];
   let okCount = 0;
   const errors = [];
-  for (let i = 0; i < records.length; i++) {
+  let progress = 0;
+
+  for (const [bytes, group] of fileGroups) {
     try {
-      const bytes = await generateFixedPdf(records[i]);
-      const sub = await PDFDocument.load(bytes);
-      const copied = await merged.copyPages(sub, sub.getPageIndices());
-      copied.forEach(p => merged.addPage(p));
-      okCount++;
+      // 元PDFを直接ロード（copyPages しないのでフォント情報が保持される）
+      const doc = await PDFDocument.load(bytes.slice(0));
+      doc.registerFontkit(fontkit);
+      const font = await doc.embedFont(await loadFont());
+      const pages = doc.getPages();
+
+      for (const r of group.records) {
+        try {
+          const { A, C, D, total } = calc(r);
+          for (let pi = 0; pi < r.pageNums.length; pi++) {
+            const pageIdx = r.pageNums[pi];
+            if (pageIdx < pages.length) {
+              applyFixesToPage(pages[pageIdx], r.pagesItems[pi] || [], r, { A, C, D, total }, font, rgb);
+            }
+          }
+          okCount++;
+        } catch (e) {
+          console.error(r.name, e);
+          errors.push(`${r.name}: ${e.message}`);
+        }
+        progress++;
+        $('#status').textContent = `PDF生成中... (${progress}/${records.length})`;
+      }
+
+      const out = await doc.save();
+      outputs.push({ name: group.fileName, bytes: out });
     } catch (e) {
-      console.error(records[i].fileName, e);
-      errors.push(`${records[i].fileName}: ${e.message}`);
+      console.error(group.fileName, e);
+      errors.push(`${group.fileName}: ${e.message}`);
     }
-    $('#status').textContent = `PDF生成中... (${i + 1}/${records.length})`;
   }
+
   if (errors.length) {
     alert(`エラー ${errors.length}件:\n` + errors.slice(0, 5).join('\n'));
   }
@@ -445,14 +468,30 @@ async function generateAll() {
     $('#generate-btn').disabled = false;
     return;
   }
-  const out = await merged.save();
-  const blob = new Blob([out], { type: 'application/pdf' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `自賠責修正済_${new Date().toISOString().slice(0, 10)}.pdf`;
-  a.click();
-  URL.revokeObjectURL(url);
+
+  // 出力: 1ファイルならそのままDL、複数ならZIP
+  if (outputs.length === 1) {
+    const blob = new Blob([outputs[0].bytes], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `自賠責修正済_${new Date().toISOString().slice(0, 10)}.pdf`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } else {
+    const zip = new JSZip();
+    for (const o of outputs) {
+      zip.file(`修正済_${o.name}`, o.bytes);
+    }
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `自賠責修正済_${new Date().toISOString().slice(0, 10)}.zip`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   $('#status').textContent = `完了 (${okCount}件)`;
   $('#generate-btn').disabled = false;
 }
