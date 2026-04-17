@@ -111,7 +111,7 @@ function buildRecord(file, buf, group) {
     for (let k = nameIdx + 1; k < Math.min(nameIdx + 12, items.length); k++) {
       const s = items[k].str.trim();
       if (!s || s === '名') continue;
-      if (/^\d/.test(s) || /[年月男女才生]/.test(s)) break;
+      if (/^\d/.test(s) || /[年月男女才生]/.test(s) || /^(平成|昭和|令和|大正)$/.test(s)) break;
       if (refY === null) refY = items[k].y;
       if (Math.abs(items[k].y - refY) > 10) break;
       nameParts.push(s);
