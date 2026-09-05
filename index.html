@@ -9,7 +9,7 @@
 <body>
 <header>
   <h1>自賠責レセプト自動処理</h1>
-  <p class="subtitle">デジカル出力PDFを一括修正・金額自動計算</p>
+  <p class="subtitle">デジカル出力PDFを一括修正・金額自動計算（健保準拠/労災準拠の両様式に対応）</p>
 </header>
 
 <main>
@@ -39,6 +39,12 @@
       </label>
       <button id="apply-date" class="btn-sm">全員に適用</button>
     </div>
+    <div class="bulk-row">
+      <label>診断書：<input type="number" id="bulk-ho" value="1" style="width:50px">通</label>
+      <label>明細書：<input type="number" id="bulk-he" value="1" style="width:50px">通</label>
+      <button id="apply-fees" class="btn-sm">全員に適用</button>
+      <span class="hint">※読込時は全員 1通／1通 で入っています</span>
+    </div>
   </section>
 
   <section id="table-section" style="display:none;">
@@ -49,19 +55,18 @@
           <tr>
             <th>#</th>
             <th>患者名</th>
+            <th>様式</th>
             <th>診療月</th>
             <th>実日数</th>
-            <th>㋑点数</th>
-            <th>A<br>(㋑×20)</th>
-            <th>㋩</th>
-            <th>C<br>(㋩×12)</th>
-            <th>ニ<br>その他</th>
-            <th>ホ通数<br>診断書</th>
-            <th>ホ金額<br>(自動)</th>
-            <th>ヘ通数<br>明細書</th>
-            <th>ヘ金額<br>(自動)</th>
-            <th>D計</th>
-            <th>合計</th>
+            <th>点数</th>
+            <th>金額<br>(諸費用前)</th>
+            <th>診断書<br>通</th>
+            <th>診断書料<br>(自動)</th>
+            <th>明細書<br>通</th>
+            <th>明細書料<br>(自動)</th>
+            <th>その他</th>
+            <th>諸費用計<br>(自動)</th>
+            <th>請求合計</th>
             <th>請求先</th>
             <th>日付</th>
           </tr>

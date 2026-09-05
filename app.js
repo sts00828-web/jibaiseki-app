@@ -7,12 +7,18 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = 'lib/pdf.worker.min.js';
 const STORAGE_KEY = 'jibaiseki_payees';
 const FONT_URL = 'fonts/NotoSansJP-Regular.otf';
 
+const HO_FEE = 6500;  // 診断書料 (1通)
+const HE_FEE = 3300;  // 明細書料 (1通)
+const TANKA  = 20;    // 自賠責 1点単価 (円)
+
 let records = [];      // 解析済みレコード配列
 let fontBytes = null;  // 日本語フォント (キャッシュ)
 
 // ========== ユーティリティ ==========
 function $(sel) { return document.querySelector(sel); }
 function $$(sel) { return [...document.querySelectorAll(sel)]; }
+function norm(s) { return String(s).replace(/\s+/g, ''); }
+function num(s) { return parseInt(String(s).replace(/[^\d]/g, ''), 10) || 0; }
 
 function loadPayees() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; }
@@ -33,13 +39,84 @@ function refreshPayeeOptions() {
   });
 }
 
+// フォント読込
+// サーバー経由(Vercel/起動.bat)なら fetch。index.htmlを直接開いた場合は
+// fetchがブラウザに遮断されるので、そのときだけ埋め込みbase64を読み込む。
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error(src + ' の読込に失敗'));
+    document.head.appendChild(s);
+  });
+}
+function b64ToArrayBuffer(b64) {
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr.buffer;
+}
 async function loadFont() {
   if (fontBytes) return fontBytes;
-  const res = await fetch(FONT_URL);
-  if (!res.ok) throw new Error('フォント取得失敗');
-  fontBytes = await res.arrayBuffer();
-  return fontBytes;
+  try {
+    const res = await fetch(FONT_URL);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    fontBytes = await res.arrayBuffer();
+    return fontBytes;
+  } catch (e) {
+    // file:// で開いた場合のフォールバック
+    if (!window.NOTO_SANS_JP_B64) await loadScript('fonts/font-base64.js');
+    if (!window.NOTO_SANS_JP_B64) throw new Error('フォント取得失敗');
+    fontBytes = b64ToArrayBuffer(window.NOTO_SANS_JP_B64);
+    return fontBytes;
+  }
 }
+
+// ========== 行(row)ユーティリティ ==========
+// 同じ高さ(y)のテキストアイテムを1行にまとめる。返り値は上から下の順。
+function rowsOf(items, tol = 2.2) {
+  const rows = [];
+  for (const it of items) {
+    let r = rows.find(r => Math.abs(r.y - it.y) < tol);
+    if (!r) { r = { y: it.y, items: [] }; rows.push(r); }
+    r.items.push(it);
+  }
+  rows.forEach(r => r.items.sort((a, b) => a.x - b.x));
+  rows.sort((a, b) => b.y - a.y);
+  return rows;
+}
+function rowText(r) { return norm(r.items.map(i => i.str).join('')); }
+
+// J902(健保準拠様式)の右下「請求額」ブロックを構造的に特定する。
+// 総請求額の行を起点に、その上の数行(小計/その他/明細書料/診断書料…)を拾う。
+function billBlock(items) {
+  const right = items.filter(i => i.x > 321);
+  const rows = rowsOf(right, 2.2);
+  const total = rows.find(r => /総請求額/.test(rowText(r)));
+  if (!total) return null;
+  // 右端に「円」があり、総請求額行から上に120pt以内の行だけを対象にする
+  const block = rows.filter(r =>
+    r.y >= total.y - 3 && r.y <= total.y + 120 && r.items.some(isYenCell)
+  );
+  const find = (re) => block.find(r => re.test(rowText(r)));
+  const subs = block.filter(r => /小計/.test(rowText(r)) && r.y > total.y)
+    .sort((a, b) => a.y - b.y);
+  return {
+    total,
+    ho: find(/診断書料/),
+    he: find(/明細書料/),
+    other: block.find(r => /その他/.test(rowText(r))),
+    sub: subs[0] || null   // 総請求額のすぐ上の「小計」= 諸費用の小計
+  };
+}
+// pdf.jsが「28,880」と「円」を1アイテムに結合する場合があるため、
+// 「円を含むセル」「数字を含むセル」で別々に探す（同一アイテムのこともある）。
+// 結合時は左端が寄るので、判定は右端(x+w)で行う。
+const isYenCell = (i) => i.str.includes('円') && (i.x + (i.w || 0)) > 545;
+const yenOf = (r) => r && r.items.find(isYenCell);
+const tsuOf = (r) => r && r.items.find(i => i.str.trim().startsWith('通'));
+const amtOf = (r) => r && r.items.find(i => /\d/.test(i.str) && i.x > 400);
 
 // ========== PDFテキスト抽出 ==========
 async function extractPdfData(file) {
@@ -59,48 +136,56 @@ async function extractPdfData(file) {
     allPagesItems.push(items);
   }
 
-  // 患者ごとに分割: 「J9A2」を含むページが先頭
-  const groups = []; // [{ pages: [pageNum...], items: [pageItems...] }]
+  // 患者ごとに分割: レセプト番号「(12)[234643]」が同じページは同一患者
+  // (摘要が溢れた続きページにも同じ番号が入る)
+  const groups = [];
+  let lastNo = null;
   for (let i = 0; i < allPagesItems.length; i++) {
-    const hasHeader = allPagesItems[i].some(it => it.str.includes('J9A2') || it.str.includes('J902'));
-    if (hasHeader || groups.length === 0) {
-      groups.push({ pageNums: [i], pagesItems: [allPagesItems[i]] });
-    } else {
+    const t = norm(allPagesItems[i].map(x => x.str).join(''));
+    const m = t.match(/\((\d+)\)\[(\d+)\]/);
+    const no = m ? m[0] : null;
+    if (no && no === lastNo && groups.length) {
       const last = groups[groups.length - 1];
       last.pageNums.push(i);
       last.pagesItems.push(allPagesItems[i]);
+    } else {
+      groups.push({ receiptNo: no, pageNums: [i], pagesItems: [allPagesItems[i]] });
+      lastNo = no;
     }
   }
 
-  const records = [];
-  for (const g of groups) {
-    records.push(buildRecord(file, buf, g));
-  }
-  return records;
+  const out = [];
+  for (const g of groups) out.push(buildRecord(file, buf, g));
+  return out;
 }
 
 function buildRecord(file, buf, group) {
   const items = group.pagesItems[0];
   const fullText = items.map(i => i.str).join('\n');
+  const flat = norm(fullText);
 
-  // パース
   const data = {
     fileName: file.name,
     originalBytes: buf,
+    receiptNo: group.receiptNo || '',
     pageNums: group.pageNums,
     items,
     pagesItems: group.pagesItems,
+    form: flat.includes('J9A2') ? 'J9A2' : 'J902',
     name: '',
     period: '',
     days: 0,
-    points: 0,    // ㋑
-    smallSum: 0,  // ㋩
+    points: 0,      // J9A2: ㋑技術点数 / J902: 合計点数
+    smallSum: 0,    // J9A2: ㋩ (10小計 円)
     B: 0,
-    D_other: 0,  // ニ
-    ho_count: 0, ho_amount: 0,  // 診断書料
-    he_count: 0, he_amount: 0,  // 明細書料
+    baseTotal: 0,   // 諸費用を除く請求額
+    tanka: 0,       // J902: ※1点単価
+    D_other: 0,     // ニ その他
+    ho_count: 1, ho_amount: 0,  // 診断書料 (既定1通)
+    he_count: 1, he_amount: 0,  // 明細書料 (既定1通)
     payee: '',
-    date: ''
+    date: '',
+    warn: ''
   };
 
   // 氏名: 「氏名」のすぐ後ろの非数値・非記号テキストを結合（フルネーム）
@@ -127,33 +212,57 @@ function buildRecord(file, buf, group) {
   const daysMatch = fullText.match(/診療実日数[\s\S]{0,30}?(\d+)\s*日/);
   if (daysMatch) data.days = parseInt(daysMatch[1]);
 
-  // 技術点数 ㋑ (10〜80点数計の右の数値) - ラベル「点数計」付近の最大数値
-  const tenMatch = fullText.match(/(\d{1,3}(?:,\d{3})*|\d+)\s*点/g);
-  // より確実: 「3,363 点」のような形を探す
-  const ptMatches = [...fullText.matchAll(/([\d,]+)\s*点/g)]
-    .map(m => parseInt(m[1].replace(/,/g, '')))
-    .filter(n => n > 0);
-  if (ptMatches.length) data.points = Math.max(...ptMatches);
+  if (data.form === 'J9A2') {
+    // ---- 労災準拠様式: ㋑点数と㋩から A/B/C を計算し直す ----
+    const ptMatches = [...fullText.matchAll(/([\d,]+)\s*点/g)]
+      .map(m => parseInt(m[1].replace(/,/g, '')))
+      .filter(n => n > 0);
+    if (ptMatches.length) data.points = Math.max(...ptMatches);
 
-  // ㋩ = 右側 10小計 (円). 全「小計」のうち右側 (xが大きい) かつ金額欄
-  const koukeiItems = items.filter(i => /小計/.test(i.str));
-  const xs = koukeiItems.map(i => i.x);
-  const midX = (Math.min(...xs) + Math.max(...xs)) / 2;
-  const rightKoukei = koukeiItems.filter(i => i.x > midX);
-  if (rightKoukei.length) {
-    // 右側で最上段 (10小計のはず)
-    const top = rightKoukei.sort((a, b) => b.y - a.y)[0];
-    const rowNums = items.filter(i =>
-      Math.abs(i.y - top.y) < 8 &&
-      i.x > top.x &&
-      /^[\d,]+$/.test(i.str.trim())
-    ).sort((a, b) => a.x - b.x);
-    if (rowNums.length) data.smallSum = parseInt(rowNums[0].str.replace(/,/g, ''));
-  }
-  // フォールバック: テキスト全体検索
-  if (!data.smallSum) {
-    const m = fullText.match(/10小計\s*(\d{1,5})/);
-    if (m) data.smallSum = parseInt(m[1]);
+    // ㋩ = 右側 10小計 (円)
+    const koukeiItems = items.filter(i => /小計/.test(i.str));
+    if (koukeiItems.length) {
+      const xs = koukeiItems.map(i => i.x);
+      const midX = (Math.min(...xs) + Math.max(...xs)) / 2;
+      const rightKoukei = koukeiItems.filter(i => i.x > midX);
+      if (rightKoukei.length) {
+        const top = rightKoukei.sort((a, b) => b.y - a.y)[0];
+        const rowNums = items.filter(i =>
+          Math.abs(i.y - top.y) < 8 && i.x > top.x && /^[\d,]+$/.test(i.str.trim())
+        ).sort((a, b) => a.x - b.x);
+        if (rowNums.length) data.smallSum = parseInt(rowNums[0].str.replace(/,/g, ''));
+      }
+    }
+    if (!data.smallSum) {
+      const m = flat.match(/10小計([\d,]+)円/);
+      if (m) data.smallSum = num(m[1]);
+    }
+  } else {
+    // ---- 健保準拠様式: 既に1点20円で計算済み。総請求額をそのまま土台にする ----
+    const tk = flat.match(/技術料(\d+)円/);
+    if (tk) data.tanka = parseInt(tk[1]);
+
+    // 合計行 (※1点単価 医薬品等 XX円  <点数>  <金額>)
+    const yaku = items.find(i => norm(i.str).includes('医薬品等'));
+    if (yaku) {
+      const nums = items.filter(i =>
+        Math.abs(i.y - yaku.y) < 2.5 && i.x > 230 && /^[\d,]+$/.test(i.str.trim())
+      ).sort((a, b) => a.x - b.x);
+      if (nums.length >= 2) {
+        data.points = num(nums[0].str);
+        data.baseTotal = num(nums[1].str);
+      }
+    }
+    // 総請求額欄から読み直す (こちらが正)
+    const blk = billBlock(items);
+    const amt = amtOf(blk && blk.total);
+    if (amt) data.baseTotal = num(amt.str);
+    if (!data.baseTotal) {
+      const m = flat.match(/総請求額([\d,]+)円/);
+      if (m) data.baseTotal = num(m[1]);
+    }
+    if (!blk) data.warn = '請求額欄を認識できず';
+    else if (data.tanka && data.tanka !== TANKA) data.warn = `1点単価が${data.tanka}円`;
   }
 
   return data;
@@ -161,26 +270,33 @@ function buildRecord(file, buf, group) {
 
 // ========== 計算 ==========
 function calc(r) {
-  const A = r.points * 20;
-  const C = Math.round((r.smallSum || 0) * 1.2);
-  const ho = (r.ho_count || 0) * 6500;
-  const he = (r.he_count || 0) * 3300;
+  const ho = (r.ho_count || 0) * HO_FEE;
+  const he = (r.he_count || 0) * HE_FEE;
   r.ho_amount = ho;
   r.he_amount = he;
-  const D = (r.D_other || 0) + ho + he;
-  const total = A + (r.B || 0) + C + D;
-  return { A, C, D, total };
+  const D = (r.D_other || 0) + ho + he;   // 諸費用計 (ニ＋ホ＋ヘ)
+  let A = 0, B = 0, C = 0, base = 0;
+  if (r.form === 'J9A2') {
+    A = (r.points || 0) * TANKA;
+    B = r.B || 0;
+    C = Math.round((r.smallSum || 0) * 1.2);
+    base = A + B + C;
+  } else {
+    base = r.baseTotal || 0;
+  }
+  return { A, B, C, D, ho, he, base, total: base + D };
 }
 
 function updateRowCalc(i) {
   const r = records[i];
-  const { D, total } = calc(r);
+  const { D, ho, he, base, total } = calc(r);
   const row = document.querySelector(`#recept-table tbody tr:nth-child(${i + 1})`);
   if (!row) return;
-  row.children[10].textContent = (r.ho_count * 6500).toLocaleString();
-  row.children[12].textContent = (r.he_count * 3300).toLocaleString();
-  row.children[13].textContent = D.toLocaleString();
-  row.children[14].textContent = total.toLocaleString();
+  row.querySelector('.c-ho').textContent = ho.toLocaleString();
+  row.querySelector('.c-he').textContent = he.toLocaleString();
+  row.querySelector('.c-d').textContent = D.toLocaleString();
+  row.querySelector('.c-base').textContent = base.toLocaleString();
+  row.querySelector('.c-total').textContent = total.toLocaleString();
 }
 
 // ========== テーブル描画 ==========
@@ -188,36 +304,34 @@ function renderTable() {
   const tbody = $('#recept-table tbody');
   tbody.innerHTML = '';
   records.forEach((r, idx) => {
-    const { A, C, D, total } = calc(r);
+    const { D, ho, he, base, total } = calc(r);
     const tr = document.createElement('tr');
+    if (r.warn) tr.classList.add('warn');
     tr.innerHTML = `
       <td>${idx + 1}</td>
-      <td style="text-align:left">${r.name || '?'}</td>
+      <td style="text-align:left">${r.name || '?'}${r.warn ? ` <span class="warn-tag" title="${r.warn}">要確認</span>` : ''}</td>
+      <td class="form-${r.form}">${r.form === 'J9A2' ? '労災準拠' : '健保準拠'}</td>
       <td>${r.period}</td>
       <td>${r.days}</td>
-      <td>${r.points.toLocaleString()}</td>
-      <td class="auto">${A.toLocaleString()}</td>
-      <td>${r.smallSum.toLocaleString()}</td>
-      <td class="auto">${C.toLocaleString()}</td>
+      <td>${(r.points || 0).toLocaleString()}</td>
+      <td class="auto c-base">${base.toLocaleString()}</td>
+      <td><input type="number" data-i="${idx}" data-f="ho_count" value="${r.ho_count}" style="width:40px"></td>
+      <td class="auto c-ho">${ho.toLocaleString()}</td>
+      <td><input type="number" data-i="${idx}" data-f="he_count" value="${r.he_count}" style="width:40px"></td>
+      <td class="auto c-he">${he.toLocaleString()}</td>
       <td><input type="number" data-i="${idx}" data-f="D_other" value="${r.D_other || ''}" placeholder="0"></td>
-      <td><input type="number" data-i="${idx}" data-f="ho_count" value="${r.ho_count || ''}" placeholder="0" style="width:40px"></td>
-      <td class="auto">${(r.ho_count * 6500).toLocaleString()}</td>
-      <td><input type="number" data-i="${idx}" data-f="he_count" value="${r.he_count || ''}" placeholder="0" style="width:40px"></td>
-      <td class="auto">${(r.he_count * 3300).toLocaleString()}</td>
-      <td class="auto">${D.toLocaleString()}</td>
-      <td class="total">${total.toLocaleString()}</td>
+      <td class="auto c-d">${D.toLocaleString()}</td>
+      <td class="total c-total">${total.toLocaleString()}</td>
       <td><select class="payee-sel" data-i="${idx}" data-f="payee"></select></td>
       <td><input type="date" class="wide" data-i="${idx}" data-f="date" value="${r.date}"></td>
     `;
     tbody.appendChild(tr);
   });
   refreshPayeeOptions();
-  // 既存値を復元
   records.forEach((r, idx) => {
     const sel = document.querySelector(`select.payee-sel[data-i="${idx}"]`);
     if (sel) sel.value = r.payee || '';
   });
-  // イベント
   $$('#recept-table input, #recept-table select').forEach(el => {
     el.addEventListener('input', e => {
       const i = +e.target.dataset.i, f = e.target.dataset.f;
@@ -226,7 +340,8 @@ function renderTable() {
       if (e.target.type === 'number') updateRowCalc(i);
     });
   });
-  $('#count').textContent = `(${records.length}件)`;
+  const n902 = records.filter(r => r.form === 'J902').length;
+  $('#count').textContent = `(${records.length}件 / 健保準拠${n902}・労災準拠${records.length - n902})`;
 }
 
 // ========== ファイル読込 ==========
@@ -252,156 +367,161 @@ async function handleFiles(files) {
 
 // ========== PDF修正 ==========
 
-function applyFixesToPage(page, items, r, calcResult, font, rgb) {
-  const { A, C, D, total } = calcResult;
-  const draw = (text, x, y, size = 9) => {
-    page.drawText(String(text), { x, y, size, font, color: rgb(0, 0, 0) });
+// 描画ヘルパを作る
+function painter(page, font, rgb) {
+  return {
+    draw(text, x, y, size = 7.5) {
+      page.drawText(String(text), { x, y, size, font, color: rgb(0, 0, 0) });
+    },
+    // 右端 rightX で右寄せ描画
+    drawRight(text, rightX, y, size = 7.5) {
+      const s = String(text);
+      let w;
+      try { w = font.widthOfTextAtSize(s, size); } catch { w = s.length * size * 0.55; }
+      page.drawText(s, { x: rightX - w, y, size, font, color: rgb(0, 0, 0) });
+    },
+    whiteOut(x, y, w, h) {
+      page.drawRectangle({ x: x - 0.3, y: y - 1.5, width: w + 0.6, height: h + 1, color: rgb(1, 1, 1) });
+    }
   };
-  const whiteOut = (x, y, w, h) => {
-    // 下方向にだけ少し拡張（descender対策）、罫線にかからないように上は拡張しない
-    page.drawRectangle({ x: x - 0.3, y: y - 1.5, width: w + 0.6, height: h + 1, color: rgb(1, 1, 1) });
-  };
+}
+
+// --- 共通: 上記金額 / 請求先 / 日付 ---
+function applyFooter(items, r, total, P) {
+  const kingakuLabel = items.find(i => norm(i.str).includes('上記金額'));
+  if (!kingakuLabel) return;
+  P.draw(total.toLocaleString(), kingakuLabel.x + 50, kingakuLabel.y, 9);
+
+  if (r.payee) {
+    const rowItems = items.filter(i => Math.abs(i.y - kingakuLabel.y) < 5);
+    const wo = rowItems.find(i => i.str.includes('を'));
+    const tono = rowItems.find(i => i.str.includes('殿'));
+    const leftX = wo ? (wo.x + (wo.w || 8) + 4) : (kingakuLabel.x + 60);
+    const rightX = tono ? (tono.x - 2) : (kingakuLabel.x + 260);
+    const gap = Math.max(40, rightX - leftX);
+    let size = 9;
+    if (r.payee.length * size > gap) size = Math.max(5, gap / r.payee.length);
+    const w = r.payee.length * size;
+    P.draw(r.payee, leftX + (gap - w) / 2, kingakuLabel.y, size);
+  }
+
+  if (r.date) {
+    const [yy, mm, dd] = r.date.split('-');
+    const reiwa = parseInt(yy) - 2018;
+    const below = items.filter(i => i.y < kingakuLabel.y && i.y > kingakuLabel.y - 40);
+    const yItem = below.find(i => i.str.trim() === '年');
+    const mItem = below.find(i => i.str.trim() === '月');
+    const dItem = below.find(i => i.str.trim() === '日');
+    if (yItem && mItem && dItem) {
+      P.draw(`令和${reiwa}`, yItem.x - 24, yItem.y, 9);
+      P.draw(String(parseInt(mm)), mItem.x - 12, mItem.y, 9);
+      P.draw(String(parseInt(dd)), dItem.x - 12, dItem.y, 9);
+    } else {
+      P.draw(`${reiwa}年 ${parseInt(mm)}月 ${parseInt(dd)}日`, kingakuLabel.x + 30, kingakuLabel.y - 22, 9);
+    }
+  }
+}
+
+// --- 健保準拠様式 (J902): 諸費用を記入し総請求額を打ち直す ---
+function applyJ902(page, items, r, c, P) {
+  const blk = billBlock(items);
+  if (blk) {
+    // 金額欄: 右端の「円」の左に右寄せ。既存の数字があれば白塗りしてから。
+    const put = (row, value, count) => {
+      if (!row) return;
+      const tsu = tsuOf(row);
+      if (tsu && count) P.drawRight(String(count), tsu.x - 3, tsu.y, 7.5);
+      const yen = yenOf(row);
+      const old = amtOf(row);
+      if (old) P.whiteOut(old.x, old.y, old.w, old.h);
+      if (!value || !yen) return;
+      const y = old ? old.y : yen.y;
+      if (old && old === yen) {
+        // 「28,880円」が1アイテム → 円ごと描き直す
+        P.drawRight(value.toLocaleString() + '円', yen.x + yen.w, y, 7.5);
+      } else {
+        P.drawRight(value.toLocaleString(), yen.x - 4, y, 7.5);
+      }
+    };
+    put(blk.ho, c.ho, r.ho_count);
+    put(blk.he, c.he, r.he_count);
+    put(blk.other, r.D_other || 0, 0);
+    put(blk.sub, c.D, 0);
+    put(blk.total, c.total, 0);   // 既存の総請求額を白塗りして打ち直す
+  }
+  applyFooter(items, r, c.total, P);
+}
+
+// --- 労災準拠様式 (J9A2): 様式・単価を書き換え A/B/C/D を計算し直す ---
+function applyJ9A2(page, items, r, c, P) {
   const findItem = (pred) => items.find(pred);
 
   // 1. J9A2 → J902
   const j = findItem(i => i.str.includes('J9A2'));
   if (j) {
-    whiteOut(j.x, j.y, j.w, j.h);
-    draw('J902', j.x, j.y, j.h);
+    P.whiteOut(j.x, j.y, j.w, j.h);
+    P.draw('J902', j.x, j.y, j.h);
   }
 
-  // 2. A（㋑×単価×1.2） → A（㋑×単価×2.0）
-  // 「1.2」を含むアイテムを全て取得し、同じ行のCラベルと区別
-  // Aは「単価」を含む or 行内最左の1.2
-  const re12 = /[1１][．.\u30fb][2２]/;
+  // 2. A（㋑×単価×1.2） → ×2.0
+  const re12 = /[1１][．.・][2２]/;
   const all12 = items.filter(i => re12.test(i.str));
-  // 単価を含むものが第一候補
   let a12Targets = all12.filter(i => i.str.includes('単価'));
   if (a12Targets.length === 0 && all12.length >= 1) {
-    // 同じ行 (yが近い) でグループ化し、各行の左端を採用
     const rows = {};
-    all12.forEach(i => {
-      const key = Math.round(i.y);
-      (rows[key] = rows[key] || []).push(i);
-    });
-    Object.values(rows).forEach(row => {
-      row.sort((a, b) => a.x - b.x);
-      a12Targets.push(row[0]); // Aは左、Cは右
-    });
+    all12.forEach(i => { const k = Math.round(i.y); (rows[k] = rows[k] || []).push(i); });
+    Object.values(rows).forEach(row => { row.sort((a, b) => a.x - b.x); a12Targets.push(row[0]); });
   }
   for (const a12 of a12Targets) {
-    whiteOut(a12.x, a12.y, a12.w, a12.h);
-    draw(a12.str.replace(re12, '2.0'), a12.x, a12.y, a12.h);
+    P.whiteOut(a12.x, a12.y, a12.w, a12.h);
+    P.draw(a12.str.replace(re12, '2.0'), a12.x, a12.y, a12.h);
   }
 
-  // 3. 請求額計算行 (A,B,C,D,合計の金額)
-  // ラベル行: "請求額" or "の計算" を探し、その直下の数値5つを置換
-  const reqLabel = findItem(i => i.str.includes('請求額')) || findItem(i => i.str.includes('の計算'));
+  // 3. 請求額の計算行 (A,B,C,D,合計)
+  const reqLabel = findItem(i => norm(i.str).includes('請求額')) || findItem(i => norm(i.str).includes('の計算'));
   if (reqLabel) {
-    // ラベル行のy座標 (請求額/の計算が縦書き2行構成のことあり、y範囲広めに)
-    // 数値行: ラベルy より下、35 unit以内、円や数字を含む
     const moneyRow = items.filter(i =>
-      i.y < reqLabel.y + 5 && i.y > reqLabel.y - 35 &&
-      i.x > reqLabel.x + 20 &&
+      i.y < reqLabel.y + 5 && i.y > reqLabel.y - 35 && i.x > reqLabel.x + 20 &&
       (/^[\d,]+$/.test(i.str.trim()) || i.str.trim() === '円')
     );
-    // y座標でクラスタリング (1行のはず)
     if (moneyRow.length) {
-      // 同じy(±2)のものに絞る - 円と数字が交互に並ぶ
-      const ys = moneyRow.map(i => i.y);
-      const targetY = ys.sort((a, b) => b - a)[0];
-      const sameRow = moneyRow.filter(i => Math.abs(i.y - targetY) < 3)
-        .sort((a, b) => a.x - b.x);
-      // 数字だけ抽出 (5個: A,B,C,D,合計)
-      const nums = sameRow.filter(i => /^[\d,]+$/.test(i.str.trim()));
-      // 既存数字を白塗り
-      sameRow.forEach(it => whiteOut(it.x, it.y, it.w, it.h));
-      // 5列の中央x座標を計算 - 既存数字位置から
+      const targetY = moneyRow.map(i => i.y).sort((a, b) => b - a)[0];
+      const sameRow = moneyRow.filter(i => Math.abs(i.y - targetY) < 3).sort((a, b) => a.x - b.x);
+      sameRow.forEach(it => P.whiteOut(it.x, it.y, it.w, it.h));
       const yens = sameRow.filter(i => i.str.trim() === '円');
-      // 元の各「数字 円」ペアの位置に新数字を描画
-      // nums と yens を順に対応させる
-      const values = [A, r.B || 0, C, D, total];
-      const labels = ['A', 'B', 'C', 'D', '合計'];
+      const values = [c.A, c.B, c.C, c.D, c.total];
       for (let k = 0; k < Math.min(5, yens.length); k++) {
         const v = values[k];
-        if (v === 0 && k !== 4 && k !== 0) {
-          // 0は描画しない (Bが空欄なら空のまま)
-          draw('円', yens[k].x, yens[k].y, yens[k].h);
-          continue;
-        }
-        // 数字を円の左に描画
-        const numStr = v.toLocaleString();
-        const numW = numStr.length * 5;
-        draw(numStr, yens[k].x - numW - 2, yens[k].y, yens[k].h);
-        draw('円', yens[k].x, yens[k].y, yens[k].h);
+        if (v === 0 && k !== 0 && k !== 4) { P.draw('円', yens[k].x, yens[k].y, yens[k].h); continue; }
+        P.drawRight(v.toLocaleString(), yens[k].x - 2, yens[k].y, yens[k].h);
+        P.draw('円', yens[k].x, yens[k].y, yens[k].h);
       }
     }
   }
 
-  // 同じ行(±2)・指定x範囲のアイテムを取得
-  const sameRow = (label) => items.filter(i => Math.abs(i.y - label.y) < 3 && i.x > label.x);
-
-  // 4. 診断書料 (ホ) - 同行の「通」「円」を見つけて、その左側に描画
-  const hoLabel = findItem(i => i.str.includes('診断書料'));
-  if (hoLabel && r.ho_count) {
-    const row = sameRow(hoLabel);
-    const tsu = row.find(i => i.str.trim() === '通');
+  // 4/5. 診断書料(ホ) 明細書料(ヘ)
+  const rowOf = (label) => items.filter(i => Math.abs(i.y - label.y) < 3 && i.x > label.x);
+  const putFee = (labelRe, count, amount) => {
+    const label = findItem(i => labelRe.test(norm(i.str)));
+    if (!label || !count) return;
+    const row = rowOf(label);
+    const tsu = row.find(i => i.str.trim() === '通' || i.str.trim().startsWith('通'));
     const yen = row.find(i => i.str.trim() === '円');
-    if (tsu) draw(String(r.ho_count), tsu.x - 12, hoLabel.y, hoLabel.h);
-    const amt = (r.ho_count * 6500).toLocaleString();
-    if (yen) draw(amt, yen.x - amt.length * 6 - 2, hoLabel.y, hoLabel.h);
-    else if (tsu) draw(amt, tsu.x + 15, hoLabel.y, hoLabel.h);
-  }
-  // 5. 明細書料 (ヘ)
-  const heLabel = findItem(i => i.str.includes('明細書料'));
-  if (heLabel && r.he_count) {
-    const row = sameRow(heLabel);
-    const tsu = row.find(i => i.str.trim() === '通');
-    const yen = row.find(i => i.str.trim() === '円');
-    if (tsu) draw(String(r.he_count), tsu.x - 12, heLabel.y, heLabel.h);
-    const amt = (r.he_count * 3300).toLocaleString();
-    if (yen) draw(amt, yen.x - amt.length * 6 - 2, heLabel.y, heLabel.h);
-    else if (tsu) draw(amt, tsu.x + 15, heLabel.y, heLabel.h);
-  }
+    if (tsu) P.draw(String(count), tsu.x - 12, label.y, label.h);
+    const amt = amount.toLocaleString();
+    if (yen) P.drawRight(amt, yen.x - 2, label.y, label.h);
+    else if (tsu) P.draw(amt, tsu.x + 15, label.y, label.h);
+  };
+  putFee(/診断書料/, r.ho_count, c.ho);
+  putFee(/明細書料/, r.he_count, c.he);
 
-  // 6. 上記金額・請求先・日付 (左下)
-  const kingakuLabel = findItem(i => i.str.includes('上記金額'));
-  if (kingakuLabel) {
-    draw(total.toLocaleString(), kingakuLabel.x + 50, kingakuLabel.y, kingakuLabel.h);
-    if (r.payee) {
-      const rowItems = items.filter(i => Math.abs(i.y - kingakuLabel.y) < 5);
-      const wo = rowItems.find(i => i.str.includes('を'));
-      const tono = rowItems.find(i => i.str.includes('殿'));
-      const leftX = wo ? (wo.x + (wo.w || 8) + 4) : (kingakuLabel.x + 60);
-      const rightX = tono ? (tono.x - 2) : (kingakuLabel.x + 260);
-      const gap = Math.max(40, rightX - leftX);
-      let size = 9;
-      const charW = size * 1.0;
-      if (r.payee.length * charW > gap) {
-        size = Math.max(5, gap / r.payee.length);
-      }
-      const w = r.payee.length * size;
-      const px = leftX + (gap - w) / 2;
-      draw(r.payee, px, kingakuLabel.y, size);
-    }
-  }
-  if (r.date && kingakuLabel) {
-    const [yy, mm, dd] = r.date.split('-');
-    const reiwa = parseInt(yy) - 2018;
-    // 上記金額の下にある「年　月　日」行を探す
-    // 単独の「年」「月」「日」アイテムで、かつ kingakuLabel より下にある最初のセット
-    const belowItems = items.filter(i => i.y < kingakuLabel.y && i.y > kingakuLabel.y - 40);
-    const yItem = belowItems.find(i => i.str.trim() === '年');
-    const mItem = belowItems.find(i => i.str.trim() === '月');
-    const dItem = belowItems.find(i => i.str.trim() === '日');
-    if (yItem && mItem && dItem) {
-      draw(`令和${reiwa}`, yItem.x - 24, yItem.y, yItem.h);
-      draw(String(parseInt(mm)), mItem.x - 12, mItem.y, mItem.h);
-      draw(String(parseInt(dd)), dItem.x - 12, dItem.y, dItem.h);
-    } else {
-      draw(`${reiwa}年 ${parseInt(mm)}月 ${parseInt(dd)}日`, kingakuLabel.x + 30, kingakuLabel.y - 22, 9);
-    }
-  }
+  applyFooter(items, r, c.total, P);
+}
+
+function applyFixesToPage(page, items, r, c, font, rgb) {
+  const P = painter(page, font, rgb);
+  if (r.form === 'J9A2') applyJ9A2(page, items, r, c, P);
+  else applyJ902(page, items, r, c, P);
 }
 
 // ========== PDF生成（元PDFを直接修正 — フォント保持） ==========
@@ -412,7 +532,6 @@ async function generateAll() {
 
   const { PDFDocument, rgb } = PDFLib;
 
-  // ソースファイルごとにグループ化（同じファイル内の全患者をまとめて処理）
   const fileGroups = new Map();
   for (const r of records) {
     if (!fileGroups.has(r.originalBytes)) {
@@ -428,7 +547,6 @@ async function generateAll() {
 
   for (const [bytes, group] of fileGroups) {
     try {
-      // 元PDFを直接ロード（copyPages しないのでフォント情報が保持される）
       const doc = await PDFDocument.load(bytes.slice(0));
       doc.registerFontkit(fontkit);
       const font = await doc.embedFont(await loadFont());
@@ -436,11 +554,11 @@ async function generateAll() {
 
       for (const r of group.records) {
         try {
-          const { A, C, D, total } = calc(r);
+          const c = calc(r);
           for (let pi = 0; pi < r.pageNums.length; pi++) {
             const pageIdx = r.pageNums[pi];
             if (pageIdx < pages.length) {
-              applyFixesToPage(pages[pageIdx], r.pagesItems[pi] || [], r, { A, C, D, total }, font, rgb);
+              applyFixesToPage(pages[pageIdx], r.pagesItems[pi] || [], r, c, font, rgb);
             }
           }
           okCount++;
@@ -460,16 +578,13 @@ async function generateAll() {
     }
   }
 
-  if (errors.length) {
-    alert(`エラー ${errors.length}件:\n` + errors.slice(0, 5).join('\n'));
-  }
+  if (errors.length) alert(`エラー ${errors.length}件:\n` + errors.slice(0, 5).join('\n'));
   if (okCount === 0) {
     $('#status').textContent = `失敗: ${errors[0] || '不明なエラー'}`;
     $('#generate-btn').disabled = false;
     return;
   }
 
-  // 出力: 1ファイルならそのままDL、複数ならZIP
   if (outputs.length === 1) {
     const blob = new Blob([outputs[0].bytes], { type: 'application/pdf' });
     const url = URL.createObjectURL(blob);
@@ -480,9 +595,7 @@ async function generateAll() {
     URL.revokeObjectURL(url);
   } else {
     const zip = new JSZip();
-    for (const o of outputs) {
-      zip.file(`修正済_${o.name}`, o.bytes);
-    }
+    for (const o of outputs) zip.file(`修正済_${o.name}`, o.bytes);
     const blob = await zip.generateAsync({ type: 'blob' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -538,6 +651,13 @@ window.addEventListener('DOMContentLoaded', () => {
     const v = $('#bulk-date').value;
     if (!v) return;
     records.forEach(r => r.date = v);
+    renderTable();
+  });
+
+  $('#apply-fees').addEventListener('click', () => {
+    const ho = +$('#bulk-ho').value || 0;
+    const he = +$('#bulk-he').value || 0;
+    records.forEach(r => { r.ho_count = ho; r.he_count = he; });
     renderTable();
   });
 
